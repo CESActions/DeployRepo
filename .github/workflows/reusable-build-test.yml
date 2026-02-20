@@ -1,0 +1,75 @@
+name: Reusable - Build & Lint (Apigee)
+
+on:
+  workflow_call:
+    inputs:
+      api_name:   { required: true,  type: string }
+      repo:       { required: true,  type: string }
+      ref:        { required: false, type: string, default: 'nonprod' }
+    secrets:
+      workload_identity_provider: { required: true }
+      service_account:           { required: true }
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout caller repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repo }}
+          ref:        ${{ inputs.ref }}
+
+      - name: Setup Node for apigeelint
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install apigeelint
+        run: npm i -g apigeelint
+
+      - name: Lint Apigee proxy bundle
+        run: apigeelint -s proxies/${{ inputs.api_name }}/apiproxy -f table.js --profile apigeex
+
+      - name: Authenticate to Google (OIDC/WIF)
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ secrets.workload_identity_provider }}
+          service_account:           ${{ secrets.service_account }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Package proxy (zip)
+        run: |
+          cd proxies/${{ inputs.api_name }}
+          zip -r ../../${{ inputs.api_name }}.zip apiproxy
+          ls -lh ../../${{ inputs.api_name }}.zip
+
+      - name: Notify Slack (always)
+        if: always()
+        uses: slackapi/slack-github-action@v2
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            channel: ${{ secrets.SLACK_CHANNEL_ID }}
+            text: ":mag: Build & Lint for *${{ inputs.api_name }}* finished with *${{ job.status }}* in ${{ github.repository }}"
+
+      - name: Notify Microsoft Teams (always)
+        if: always()
+        uses: mikesprague/teams-incoming-webhook-action@v2
+        with:
+          github-token: ${{ github.token }}
+          webhook-url: ${{ secrets.MS_TEAMS_WEBHOOK_URL }}
+          title: Build & Lint ${{ inputs.api_name }}: ${{ job.status }}
+          message: |
+            Repo: ${{ github.repository }}  \n            Ref:  ${{ github.ref }}  \n            Actor: ${{ github.actor }}
+          color: ${{ job.status == 'success' && 'success' || job.status == 'cancelled' && 'warning' || 'failure' }}
+          deploy-card: true

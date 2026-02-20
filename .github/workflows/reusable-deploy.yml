@@ -1,0 +1,119 @@
+name: Reusable - Deploy Apigee Env
+
+on:
+  workflow_call:
+    inputs:
+      api_name:     { required: true,  type: string }
+      org:          { required: true,  type: string }
+      environment:  { required: true,  type: string }
+      repo:         { required: true,  type: string }
+      ref:          { required: false, type: string, default: 'nonprod' }
+      base_path:    { required: false, type: string, default: '' }
+      config_profile:{ required: false, type: string, default: 'test-env' }
+    secrets:
+      workload_identity_provider: { required: true }
+      service_account:           { required: true }
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout caller repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repo }}
+          ref:        ${{ inputs.ref }}
+
+      - name: Authenticate (OIDC/WIF)
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ secrets.workload_identity_provider }}
+          service_account:           ${{ secrets.service_account }}
+
+      - name: Install gcloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Pull secrets from Google Secret Manager
+        id: gsm
+        uses: google-github-actions/get-secretmanager-secrets@v3
+        with:
+          secrets: |
+            BACKEND_URL:${{ inputs.org }}/apigee-${{ inputs.environment }}-backend-url
+            API_KEY:${{ inputs.org }}/apigee-shared-api-key
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python deps
+        run: pip install -q requests
+
+      - name: Import + Deploy (Python)
+        env:
+          APIGEE_ORG:   ${{ inputs.org }}
+          APIGEE_ENV:   ${{ inputs.environment }}
+          API_NAME:     ${{ inputs.api_name }}
+          BASE_PATH:    ${{ inputs.base_path }}
+        run: |
+          python - <<'PY'
+          import os, json, subprocess, requests
+          ORG=os.environ['APIGEE_ORG']; ENV=os.environ['APIGEE_ENV']; NAME=os.environ['API_NAME']
+          BP=os.environ.get('BASE_PATH','')
+          token=subprocess.check_output(['gcloud','auth','print-access-token'], text=True).strip()
+          # import
+          with open(f"{NAME}.zip","rb") as f:
+              r=requests.post(
+                 f"https://apigee.googleapis.com/v1/organizations/{ORG}/apis",
+                 params={"action":"import","name":NAME},
+                 headers={"Authorization":f"Bearer {token}"},
+                 files={"file":(f"{NAME}.zip",f,"application/octet-stream")}
+              ); r.raise_for_status(); rev=r.json()['revision']
+          # deploy
+          d=requests.post(
+            f"https://apigee.googleapis.com/v1/organizations/{ORG}/environments/{ENV}/apis/{NAME}/revisions/{rev}/deployments",
+            params={"override":"true"}, headers={"Authorization":f"Bearer {token}"}
+          ); d.raise_for_status(); print(f"Deployed {NAME} rev {rev} to {ENV}")
+          if BP:
+            sb=requests.post(
+              f"https://apigee.googleapis.com/v1/organizations/{ORG}/environments/{ENV}/apis/{NAME}/revisions/{rev}/deployments:setBasePath",
+              headers={"Authorization":f"Bearer {token}","Content-Type":"application/json"},
+              data=json.dumps({"basePath":BP})
+            ); sb.raise_for_status(); print("Base path set", BP)
+          PY
+
+      - name: Sync platform config (Maven)
+        run: |
+          sudo apt-get update && sudo apt-get install -y maven
+          mvn -q -f ./maven/apigee-config-pom.xml \
+            -P ${{ inputs.config_profile }} \
+            -Dapigee.config.options=update \
+            -Denv=${{ inputs.environment }} \
+            -Dorg=${{ inputs.org }} \
+            install
+
+      - name: Notify Slack (always)
+        if: always()
+        uses: slackapi/slack-github-action@v2
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            channel: ${{ secrets.SLACK_CHANNEL_ID }}
+            text: ":rocket: Deploy *${{ inputs.api_name }}* to *${{ inputs.environment }}* finished with *${{ job.status }}*"
+
+      - name: Notify Microsoft Teams (always)
+        if: always()
+        uses: mikesprague/teams-incoming-webhook-action@v2
+        with:
+          github-token: ${{ github.token }}
+          webhook-url: ${{ secrets.MS_TEAMS_WEBHOOK_URL }}
+          title: Deploy ${{ inputs.api_name }} → ${{ inputs.environment }}: ${{ job.status }}
+          message: |
+            Org:  ${{ inputs.org }}  \n            Repo: ${{ github.repository }}  \n            Run:  ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          color: ${{ job.status == 'success' && 'success' || job.status == 'cancelled' && 'warning' || 'failure' }}
+          deploy-card: true

@@ -1,0 +1,64 @@
+name: Reusable - Promote to PROD (Approval Gate)
+
+on:
+  workflow_call:
+    inputs:
+      api_name:   { required: true,  type: string }
+      org:        { required: true,  type: string }
+      base_path:  { required: false, type: string, default: '' }
+    secrets:
+      workload_identity_provider: { required: true }
+      service_account:           { required: true }
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    environment: prod
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ secrets.workload_identity_provider }}
+          service_account:           ${{ secrets.service_account }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy to PROD
+        run: |
+          NAME="${{ inputs.api_name }}"; ORG="${{ inputs.org }}"
+          TOKEN=$(gcloud auth print-access-token)
+          REV=$(curl -s -X POST \
+               -H "Authorization: Bearer $TOKEN" \
+               -H "Content-Type: multipart/form-data" \
+               -F "file=@${NAME}.zip" \
+               "https://apigee.googleapis.com/v1/organizations/${ORG}/apis?action=import&name=${NAME}" | jq -r '.revision')
+          curl -s -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            "https://apigee.googleapis.com/v1/organizations/${ORG}/environments/prod/apis/${NAME}/revisions/${REV}/deployments?override=true" | jq .
+
+      - name: Notify Slack (always)
+        if: always()
+        uses: slackapi/slack-github-action@v2
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            channel: ${{ secrets.SLACK_CHANNEL_ID }}
+            text: ":tada: *${{ inputs.api_name }}* promoted to *prod* with status *${{ job.status }}*"
+
+      - name: Notify Microsoft Teams (always)
+        if: always()
+        uses: mikesprague/teams-incoming-webhook-action@v2
+        with:
+          github-token: ${{ github.token }}
+          webhook-url: ${{ secrets.MS_TEAMS_WEBHOOK_URL }}
+          title: Promote ${{ inputs.api_name }} → prod: ${{ job.status }}
+          message: |
+            Org:  ${{ inputs.org }}  \n            Repo: ${{ github.repository }}  \n            Run:  ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          color: ${{ job.status == 'success' && 'success' || job.status == 'cancelled' && 'warning' || 'failure' }}
+          deploy-card: true
